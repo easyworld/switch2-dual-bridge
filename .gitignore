@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+work/
+binaries/
+client-config.json
+gamepad-keymap.json
+last-draft.txt
+launch.txt
+remote-errors.log*
+firmware/Switch2Dual/secrets.h
+firmware/Switch2Dual/WakeConfig.h
+firmware/Switch2Dual/build/
+*.local.json
