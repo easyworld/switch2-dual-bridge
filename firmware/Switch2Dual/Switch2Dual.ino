@@ -9,6 +9,7 @@
 #include "esp_wifi.h"
 #include "esp_system.h"
 #include "ControllerLogic.h"
+#include "PadStream.h"
 #include "SwitchDescriptor.h"
 #include "secrets.h"
 #include "keymap.h"
@@ -24,6 +25,7 @@ SwitchHID *gamepad = &gamepadStorage;
 WebServer server(80);
 Preferences preferences;
 ControllerLogic state;
+PadStream padStream;
 portMUX_TYPE stateLock = portMUX_INITIALIZER_UNLOCKED;
 char recentJobs[16][65] = {};
 unsigned recentNext = 0;
@@ -68,7 +70,13 @@ bool number(const char *name, uint32_t low, uint32_t high, uint32_t &result) {
 }
 
 String padStatusJson() {
-  const ControllerLogic s = snapshot();
+  portENTER_CRITICAL(&stateLock);
+  const ControllerLogic s = state;
+  const bool streamActive = padStream.active;
+  const unsigned streamQueued = padStream.count;
+  const uint32_t streamNext = padStream.nextSequence;
+  const PadReport visibleReport = streamActive ? padStream.report : s.report;
+  portEXIT_CRITICAL(&stateLock);
   String json;
   json.reserve(850);
   json = "{\"firmware\":\"2.0.0\",\"mode\":\"gamepad\",\"report_bytes\":8";
@@ -79,14 +87,19 @@ String padStatusJson() {
   json += ",\"usb_mounted\":"; json += dualUsb::mounted() ? "true" : "false";
   json += ",\"usb_suspended\":"; json += tud_suspended() ? "true" : "false";
   json += ",\"hid_ready\":"; json += gamepad->hid.ready() ? "true" : "false";
-  json += ",\"busy\":"; json += s.busy ? "true" : "false";
+  json += ",\"stream\":{\"supported\":true,\"active\":";
+  json += streamActive ? "true" : "false";
+  json += ",\"queued\":" + String(streamQueued) + ",\"next_sequence\":" + String(streamNext);
+  json += ",\"lease_ms\":600,\"capacity\":16}";
+  json += ",\"legacy_busy\":"; json += s.busy ? "true" : "false";
+  json += ",\"busy\":"; json += (s.busy || streamActive) ? "true" : "false";
   json += ",\"release_pending\":"; json += s.releasePending ? "true" : "false";
   json += ",\"delivered\":"; json += s.delivered ? "true" : "false";
   json += ",\"completed\":"; json += s.completed ? "true" : "false";
   json += ",\"epoch\":" + String(s.epoch) + ",\"job\":\"" + s.job + "\",\"error\":\"" + s.error + "\"";
-  json += ",\"buttons\":" + String(s.report.buttons) + ",\"dpad\":" + String(s.report.dpad);
-  json += ",\"lx\":" + String(s.report.lx) + ",\"ly\":" + String(s.report.ly);
-  json += ",\"rx\":" + String(s.report.rx) + ",\"ry\":" + String(s.report.ry);
+  json += ",\"buttons\":" + String(visibleReport.buttons) + ",\"dpad\":" + String(visibleReport.dpad);
+  json += ",\"lx\":" + String(visibleReport.lx) + ",\"ly\":" + String(visibleReport.ly);
+  json += ",\"rx\":" + String(visibleReport.rx) + ",\"ry\":" + String(visibleReport.ry);
   json += ",\"reports_ok\":" + String(s.reportsOk) + ",\"reports_failed\":" + String(s.reportsFailed);
   json += ",\"ip\":\"" + WiFi.softAPIP().toString() + "\",\"station_connected\":";
   json += WiFi.status() == WL_CONNECTED ? "true" : "false";
@@ -124,12 +137,62 @@ void pulse() {
   report.buttons = buttons; report.dpad = dpad;
   report.lx = lx; report.ly = ly; report.rx = rx; report.ry = ry;
   portENTER_CRITICAL(&stateLock);
+  if (padStream.active && padStream.idle()) padStream.stop();
   const bool stale = epoch != state.epoch;
-  const bool accepted = state.start(report, hold, id.c_str(), epoch, millis());
+  const bool accepted = !padStream.active && state.start(report, hold, id.c_str(), epoch, millis());
   portEXIT_CRITICAL(&stateLock);
   if (!accepted) { fail(409, stale ? "stale_epoch" : "busy_or_releasing"); return; }
   id.toCharArray(recentJobs[recentNext++ % 16], 65);
   server.send(202, "application/json", String("{\"accepted\":true,\"job\":\"") + id + "\"}");
+}
+
+// Form-encoded frames: buttons,dpad,lx,ly,rx,ry,duration;... (at most 8).
+void streamInput() {
+  if (!authorized()) return;
+  if (hostDisconnecting || !dualUsb::enabled()) { fail(409,"host_disconnected"); return; }
+  if (!logicSelfTest || !dualUsb::inputReady(dualUsb::Pad)) { fail(409,"usb_not_ready"); return; }
+  uint32_t epoch, sequence;
+  if (!number("epoch",0,UINT32_MAX,epoch) || !number("sequence",0,UINT32_MAX-1,sequence)) {
+    fail(400,"invalid_stream_sequence"); return;
+  }
+  String id = server.arg("session"), encoded = server.arg("frames");
+  if (id.length() != 32 || encoded.length() > 1024) { fail(400,"invalid_stream_packet"); return; }
+  for (unsigned i = 0; i < id.length(); ++i) if (!isHexadecimalDigit(id[i])) {
+    fail(400,"invalid_stream_session"); return;
+  }
+  PadStream::Frame frames[8]; unsigned count = 0;
+  const char *cursor = encoded.c_str();
+  while (*cursor) {
+    if (count == 8) { fail(400,"too_many_stream_frames"); return; }
+    uint32_t values[7]; const uint32_t maxima[] = {16383,15,255,255,255,255,200};
+    for (unsigned field = 0; field < 7; ++field) {
+      if (*cursor < '0' || *cursor > '9') { fail(400,"invalid_stream_frame"); return; }
+      uint64_t value = 0;
+      while (*cursor >= '0' && *cursor <= '9') {
+        value = value * 10 + (*cursor++ - '0');
+        if (value > maxima[field]) { fail(400,"invalid_stream_frame"); return; }
+      }
+      values[field] = value;
+      if (field < 6 && *cursor++ != ',') { fail(400,"invalid_stream_frame"); return; }
+    }
+    if ((values[1] > 7 && values[1] != 15) || values[6] < 8) { fail(400,"invalid_stream_frame"); return; }
+    auto &frame = frames[count++];
+    frame.report.buttons = values[0]; frame.report.dpad = values[1];
+    frame.report.lx = values[2]; frame.report.ly = values[3];
+    frame.report.rx = values[4]; frame.report.ry = values[5]; frame.duration = values[6];
+    if (*cursor && *cursor++ != ';') { fail(400,"invalid_stream_frame"); return; }
+  }
+  portENTER_CRITICAL(&stateLock);
+  const char *error = epoch != state.epoch ? "stale_epoch" :
+    state.busy || state.releasePending ? "busy_or_releasing" :
+    padStream.accept(id.c_str(),sequence,frames,count,millis());
+  const uint32_t next = padStream.nextSequence;
+  const unsigned queued = padStream.count;
+  if (!error) state.error[0] = 0;
+  portEXIT_CRITICAL(&stateLock);
+  if (error) { fail(409,error); return; }
+  server.send(200,"application/json",String("{\"accepted\":true,\"next_sequence\":") +
+    String(next) + ",\"queued\":" + String(queued) + ",\"capacity\":16}");
 }
 
 // Runs independently of WebServer: slow/incomplete HTTP cannot extend a hold.
@@ -139,14 +202,22 @@ void usbTask(void *) {
     const uint32_t now = millis();
     const bool mounted = dualUsb::mounted(), suspended = tud_suspended();
     portENTER_CRITICAL(&stateLock);
-    state.tick(now, mounted, suspended);
-    const PadReport report = state.report;
-    const uint32_t generation = state.generation;
+    if (padStream.active && (!mounted || suspended || padStream.expired(now))) {
+      padStream.stop(); state.cancel("stream_expired_or_disconnected");
+    }
+    const bool streaming = padStream.active;
+    if (streaming) padStream.tick(now); else state.tick(now, mounted, suspended);
+    const PadReport report = streaming ? padStream.report : state.report;
+    const uint32_t generation = streaming ? padStream.generation : state.generation;
     portEXIT_CRITICAL(&stateLock);
     if (mounted && !suspended && gamepad->hid.ready()) {
       const bool success = gamepad->send(report);
       portENTER_CRITICAL(&stateLock);
-      state.acknowledge(generation, millis(), success);
+      if (streaming) {
+        padStream.acknowledge(generation, millis(), success);
+        if (success) ++state.reportsOk; else ++state.reportsFailed;
+      }
+      else if (!padStream.active) state.acknowledge(generation, millis(), success);
       portEXIT_CRITICAL(&stateLock);
     }
     vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(8));
@@ -189,7 +260,7 @@ void status() {
   if (!authorized()) return;
   String json;
   json.reserve(1800);
-  json = "{\"firmware\":\"dual-1.2.0\",\"mode\":\"dual\",\"usb_interfaces\":2,\"mode_switch_supported\":false";
+  json = "{\"firmware\":\"dual-1.3.0\",\"mode\":\"dual\",\"usb_interfaces\":2,\"mode_switch_supported\":false";
   json += ",\"boot_id\":" + String(bootId);
   json += ",\"usb_mounted\":"; json += dualUsb::mounted() ? "true" : "false";
   json += ",\"usb_suspended\":"; json += tud_suspended() ? "true" : "false";
@@ -216,7 +287,7 @@ void status() {
 }
 
 void stopInputs(const char *reason) {
-  portENTER_CRITICAL(&stateLock); state.cancel(reason); portEXIT_CRITICAL(&stateLock);
+  portENTER_CRITICAL(&stateLock); padStream.stop(); state.cancel(reason); portEXIT_CRITICAL(&stateLock);
   keyboardMode::stopJob(reason);
 }
 
@@ -282,6 +353,7 @@ void setup() {
     server.send(202,"application/json","{\"accepted\":true,\"duration_ms\":1000}");
   });
   server.on("/pad",HTTP_POST,pulse);
+  server.on("/pad/stream",HTTP_POST,streamInput);
   server.on("/text",HTTP_POST,[]{keyboardMode::prepareJob(false);});
   server.on("/tap",HTTP_POST,[]{keyboardMode::prepareJob(true);});
   server.on("/cancel",HTTP_POST,[]{

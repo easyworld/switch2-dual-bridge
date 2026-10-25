@@ -44,7 +44,7 @@ class Client:
             raise ValueError('板子地址应为 http://IP 或 http://主机名。')
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-    def request(self, route, values=None, job=None):
+    def request(self, route, values=None, job=None, timeout=3):
         headers = {'X-Key': self.config['api_key']}
         data = None
         if values is not None:
@@ -54,7 +54,7 @@ class Client:
             headers['X-Job'] = job
         request = urllib.request.Request(self.config['url'].rstrip('/') + route, data=data, headers=headers)
         try:
-            with self.opener.open(request, timeout=3) as response:
+            with self.opener.open(request, timeout=timeout) as response:
                 return json.load(response)
         except urllib.error.HTTPError as error:
             # No automatic retries: an unobserved press must never be repeated.
@@ -73,6 +73,26 @@ class Client:
 
     def cancel(self):
         return self.request('/cancel', {})
+
+    def stream(self, session, sequence, epoch, frames):
+        if (len(session) != 32 or any(c not in '0123456789abcdef' for c in session) or
+                type(sequence) is not int or not 0 <= sequence < 4294967295 or
+                type(epoch) is not int or not 0 <= epoch <= 4294967295 or len(frames) > 8):
+            raise ValueError('无效的连续输入数据包。')
+        rows=[]
+        for frame in frames:
+            if (len(frame) != 7 or any(type(value) is not int for value in frame) or
+                    not 0 <= frame[0] <= 16383 or frame[1] not in (*range(8),15) or
+                    any(not 0 <= axis <= 255 for axis in frame[2:6]) or not 8 <= frame[6] <= 200):
+                raise ValueError('无效的连续输入状态。')
+            rows.append(','.join(map(str,frame)))
+        result=self.request('/pad/stream',dict(session=session,sequence=sequence,epoch=epoch,
+                                             frames=';'.join(rows)),timeout=0.4)
+        if (result.get('accepted') is not True or result.get('next_sequence') != sequence+1 or
+                result.get('capacity') != 16 or type(result.get('queued')) is not int or
+                not 0 <= result['queued'] <= 16):
+            raise RuntimeError('连续输入未确认，已停止发送。')
+        return result
 
     def pulse(self, cancel=None, **values):
         cancel = cancel or threading.Event()

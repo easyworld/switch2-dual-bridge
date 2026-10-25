@@ -7,6 +7,83 @@ import unittest
 
 @unittest.skipUnless(sys.platform == 'win32', 'Windows GUI check')
 class GuiPollingTests(unittest.TestCase):
+    def test_stream_input_stays_enabled_while_network_send_is_blocked(self):
+        script = r'''
+import tempfile, threading, tkinter as tk
+from pathlib import Path
+from tkinter import ttk
+from types import SimpleNamespace
+import remote
+from pro_controller import ProControllerView
+temporary = tempfile.TemporaryDirectory()
+remote.ROOT = Path(temporary.name)
+config = {'url':'http://127.0.0.1','api_key':'test-key'}
+started, release, cancelled = threading.Event(), threading.Event(), threading.Event()
+packets, failures = [], []
+remote.RemoteClient.status = lambda self: {
+    'mode':'dual','boot_id':1,'usb_mounted':True,'usb_suspended':False,
+    'input_ready':True,'busy':False,'release_pending':False,
+    'gamepad':{'epoch':7,'input_ready':True,'legacy_busy':False,'release_pending':False,
+               'busy':True,'stream':{'supported':True,'active':bool(packets)}}}
+remote.RemoteClient.cancel = lambda self: cancelled.set()
+def stream(self,session,sequence,epoch,frames):
+    packets.append(list(frames))
+    if len(packets) == 1:
+        started.set()
+        assert release.wait(3), 'GUI failed to release blocked transport'
+    return {'capacity':16,'queued':0}
+remote.pad.Client.stream = stream
+def descendants(widget):
+    for child in widget.winfo_children():
+        yield child
+        yield from descendants(child)
+original_tk = tk.Tk
+def make_root(*args,**kwargs):
+    root = original_tk(*args,**kwargs)
+    root.withdraw()
+    phase = 0
+    def observe():
+        nonlocal phase
+        try:
+            widgets=list(descendants(root))
+            view=next(w for w in widgets if isinstance(w,ProControllerView))
+            key=lambda name,code:SimpleNamespace(keysym=name,keycode=code,state=0)
+            if phase==0 and view.streaming and view.available:
+                view._key_press(key('j',74));phase=1
+            elif phase==1 and started.is_set():
+                assert view.controls['A'].state=='normal', 'Stream disabled the controller'
+                view._key_release(key('j',74))
+                view._key_press(key('k',75));view._key_release(key('k',75))
+                assert view.controls['X'].invoke(), 'Rapid click was rejected'
+                send=next(w for w in widgets if isinstance(w,ttk.Button) and w.cget('text')=='发送全文')
+                assert str(send.cget('state'))=='normal', 'Gamepad blocked the keyboard channel'
+                release.set();phase=2
+            elif phase==2 and sum(map(len,packets))>=6:
+                frames=[frame for packet in packets for frame in packet]
+                assert [frame[0] for frame in frames[:6]]==[4,0,2,0,8,0], frames
+                stop=next(w for w in widgets if isinstance(w,ttk.Button) and str(w.cget('text')).startswith('停止 /'))
+                stop.invoke();phase=3
+            elif phase==3 and cancelled.is_set():
+                assert not view.held_actions
+                root.destroy();return
+        except Exception as error:
+            failures.append(repr(error));release.set();root.destroy();return
+        root.after(10,observe)
+    def timeout():
+        failures.append('Asynchronous GUI timed out');release.set();root.destroy()
+    root.after(10,observe);root.after(4000,timeout)
+    return root
+tk.Tk=make_root
+remote.gui(config)
+assert not failures, failures
+print('GUI_STREAM_OK')
+'''
+        result = subprocess.run([sys.executable, '-X', 'utf8', '-B', '-c', script],
+            cwd=Path(__file__).resolve().parents[1],capture_output=True,
+            text=True,encoding='utf-8',timeout=7)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('GUI_STREAM_OK',result.stdout)
+
     def test_callback_failure_does_not_lock_gamepad_after_first_press(self):
         script = r'''
 import tempfile, time, tkinter as tk

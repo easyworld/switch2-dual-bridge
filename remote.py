@@ -97,6 +97,7 @@ def gui(config, smoke=False):
     from tkinter import ttk, filedialog
     from tkinter.scrolledtext import ScrolledText
     from pro_controller import ProControllerView
+    from pad_stream import StreamSender
 
     root = tk.Tk()
     root.title('Switch 2 USB 键盘与手柄')
@@ -118,9 +119,10 @@ def gui(config, smoke=False):
     mode_bar.pack(fill='x', pady=10)
     # One query and one input may be pending; the worker keeps requests ordered.
     events, work = queue.Queue(), queue.Queue(maxsize=2)
+    stream_sender = StreamSender(lambda kind,result,error:events.put((kind,result,error)))
     state = {'inflight': False, 'query_inflight': False, 'control_inflight': False,
              'revision': 0, 'query_revision': 0, 'input_revision': 0,
-             'closing': False, 'wake_requested': False,
+             'closing': False, 'wake_requested': False, 'stream_fault': False,
              'status': {}, 'last_poll': 0.0}
     token = threading.Event()
 
@@ -262,8 +264,13 @@ def gui(config, smoke=False):
             arguments['hold']=int(pro_view.hold.get());pad.pad_state(**arguments)
         except ValueError as error:
             status_text.set(str(error));return False
+        if pro_view.streaming:
+            values=pad.pad_state(**arguments)
+            report=tuple(values[name] for name in ('buttons','dpad','lx','ly','rx','ry'))
+            return stream_sender.tap(report,values['hold'])
         return submit('pad',lambda c,p,t:p.pulse(cancel=t,**arguments))
-    pro_view=ProControllerView(pad_tab,on_action=pad_input,mapping_path=ROOT/'gamepad-keymap.json')
+    pro_view=ProControllerView(pad_tab,on_action=pad_input,mapping_path=ROOT/'gamepad-keymap.json',
+                              on_state=stream_sender.set_state)
     pro_view.pack(fill='both',expand=True)
     def tab_changed(event):
         pro_view.reset_keys()
@@ -273,6 +280,8 @@ def gui(config, smoke=False):
     progress=ttk.Progressbar(bottom,maximum=100);progress.pack(fill='x',pady=(10,4))
     def stop_input():
         token.set()
+        pro_view.reset_keys(block_held=True)
+        stream_sender.stop()
         state['wake_requested']=False
         try:current=settings()
         except ValueError as error:status_text.set(str(error));return
@@ -286,6 +295,8 @@ def gui(config, smoke=False):
         except ValueError as error:status_text.set(str(error));return
         # Disconnect bypasses the input queue, including a long text transfer.
         token.set()
+        pro_view.reset_keys(block_held=True)
+        stream_sender.stop()
         state['revision']+=1
         state['control_inflight']=True
         state['wake_requested']=False
@@ -309,6 +320,11 @@ def gui(config, smoke=False):
 
     def update_controls():
         status=state['status'];active=status.get('mode')
+        channel=status.get('gamepad',{}) if active=='dual' else status
+        streaming=channel.get('stream',{}).get('supported',False)
+        pro_view.set_streaming(streaming)
+        stream_sender.configure(dict(config,url=url.get().strip().rstrip('/')),
+                                {} if state['control_inflight'] or state['stream_fault'] else status)
         connection=status.get('connection_control',{})
         usb_enabled=connection.get('usb_enabled',True)
         for button,available in (
@@ -326,8 +342,9 @@ def gui(config, smoke=False):
         connected=usb_enabled and not state['control_inflight'] and status.get('usb_mounted') and not status.get('usb_suspended')
         for mode,controls in (('keyboard',key_controls),('gamepad',())):
             channel=status.get('gamepad',{}) if active=='dual' and mode=='gamepad' else status
-            available=(connected and not state['inflight'] and active in (mode,'dual') and
-                       not channel.get('busy') and not channel.get('release_pending') and
+            live=mode=='gamepad' and streaming
+            available=(connected and (stream_sender.enabled if live else not state['inflight']) and active in (mode,'dual') and
+                       not channel.get('legacy_busy' if live else 'busy') and not channel.get('release_pending') and
                        channel.get('input_ready',True))
             if mode=='gamepad':pro_view.set_available(available);continue
             target = 'normal' if available else 'disabled'
@@ -339,6 +356,15 @@ def gui(config, smoke=False):
         try:
             while True:
                 kind,result,error=events.get_nowait()
+                if kind in ('stream_sent','stream_error'):
+                    if kind=='stream_error':
+                        state['stream_fault']=True
+                        pro_view.reset_keys(block_held=True)
+                        state['last_poll']=0.0
+                        status_text.set(error)
+                    elif result and not state['inflight'] and not state['control_inflight']:
+                        status_text.set('实时手柄：输入已提交，可继续按键；松开即释放。')
+                    continue
                 if kind=='notice':
                     if not state['control_inflight']:status_text.set(error)
                     continue
@@ -363,6 +389,7 @@ def gui(config, smoke=False):
                     status_text.set(('唤醒请求未确认，请先查询状态。' if kind=='wake' else '')+error);continue
                 if kind in ('status','poll','connect','disconnect'):
                     previous_mode=state['status'].get('mode')
+                    state['stream_fault']=False
                     state['status']=result
                     wake=result.get('wake',{})
                     host_enabled=result.get('connection_control',{}).get('usb_enabled',True)
@@ -439,6 +466,7 @@ def gui(config, smoke=False):
 
     def close():
         state['closing']=True;token.set()
+        stream_sender.close()
         try:
             draft.write_text(editor.get('1.0','end-1c'),encoding='utf-8')
             config.update(url=url.get().strip(),layout=layout.get(),gap_ms=int(gap.get()),line_ms=int(line.get()),editor_mode=line_mode.get())

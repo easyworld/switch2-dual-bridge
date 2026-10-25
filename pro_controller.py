@@ -7,6 +7,7 @@ import sys
 import tempfile
 import tkinter as tk
 from tkinter import ttk
+from controller import BUTTONS, DPADS
 
 
 # name, short label, description, x, y, width, height, shape, pulse arguments
@@ -45,6 +46,27 @@ CONTROLS = [
     ('L+R','L+R','组合键 L+R',455,463,112,34,'pill',{'buttons':'L+R'}),
 ]
 ACTION_ARGUMENTS = {row[0]: row[-1] for row in CONTROLS}
+
+
+def report_for_actions(actions):
+    buttons=0
+    vectors={'dpad':[0,0],'left':[0,0],'right':[0,0]}
+    directions={'UP':(0,-1),'UP_RIGHT':(1,-1),'RIGHT':(1,0),'DOWN_RIGHT':(1,1),
+                'DOWN':(0,1),'DOWN_LEFT':(-1,1),'LEFT':(-1,0),'UP_LEFT':(-1,-1),'CENTER':(0,0)}
+    for name in actions:
+        arguments=ACTION_ARGUMENTS[name]
+        for button in arguments.get('buttons','').split('+'):
+            if button:buttons|=BUTTONS[button]
+        dx,dy=directions[arguments.get('dpad','CENTER')]
+        vectors['dpad'][0]+=dx;vectors['dpad'][1]+=dy
+        for axis,group,index in (('lx','left',0),('ly','left',1),('rx','right',0),('ry','right',1)):
+            if axis in arguments:vectors[group][index]+=(-1 if arguments[axis]<128 else 1)
+    def sign(value):return (value>0)-(value<0)
+    dx,dy=map(sign,vectors['dpad'])
+    dpad=next(DPADS[name] for name,vector in directions.items() if vector==(dx,dy))
+    axes=tuple(128 if value==0 else 0 if value<0 else 255
+               for group in ('left','right') for value in vectors[group])
+    return (buttons,dpad)+axes
 DEFAULT_BINDINGS = dict.fromkeys(ACTION_ARGUMENTS)
 DEFAULT_BINDINGS.update({
     'A':'j','B':'k','X':'u','Y':'i','L':'q','R':'e','ZL':'z','ZR':'c',
@@ -175,7 +197,7 @@ class CanvasControl:
         view=self.view
         selected=view.mode=='edit' and view.selected==self.name
         disabled=self.state=='disabled'
-        active=view.active==self.name
+        active=view.active==self.name or self.name in view.held_actions
         hover=view.hover==self.name and not disabled
         fill='#725b2e' if selected else '#286653' if active else '#46596c' if hover else '#303c4a'
         outline='#f2ce7a' if selected else '#8dd5bb' if active else '#a1b8cf' if hover else '#647386'
@@ -187,9 +209,16 @@ class CanvasControl:
 
 
 class ProControllerView(ttk.Frame):
-    def __init__(self,parent,*,on_action,mapping_path):
+    def __init__(self,parent,*,on_action,mapping_path,on_state=None):
         super().__init__(parent)
         self.on_action=on_action
+        self.on_state=on_state
+        self.streaming=False
+        self.held_actions=set()
+        self._key_actions={}
+        self._mouse_action=None
+        self._repeat_timer=None
+        self._repeat_phase=True
         self.mapping_path=Path(mapping_path)
         load_error=''
         try:self.bindings=load_bindings(self.mapping_path)
@@ -200,6 +229,7 @@ class ProControllerView(ttk.Frame):
         self.available=False
         self.selected=self.hover=self.active=None
         self._down=set()
+        self._blocked_keys=set()
         self._flash_timer=None
         self._resize_timer=None
         self.scale=1.0;self.offset=(0,0)
@@ -212,8 +242,19 @@ class ProControllerView(ttk.Frame):
             ttk.Radiobutton(toolbar,text=title,value=value,variable=self.mode_var,
                             command=lambda:self.set_mode(self.mode_var.get())).pack(side='left',padx=6)
         self.hold=tk.StringVar(value='150')
-        ttk.Spinbox(toolbar,from_=50,to=2000,increment=50,width=6,textvariable=self.hold).pack(side='right')
-        ttk.Label(toolbar,text='输入时长 ms').pack(side='right',padx=8)
+        self.hold_input=ttk.Spinbox(toolbar,from_=50,to=2000,increment=50,width=6,textvariable=self.hold)
+        self.hold_input.pack(side='right')
+        ttk.Label(toolbar,text='兼容点击 ms').pack(side='right',padx=8)
+        repeat_bar=ttk.Frame(self);repeat_bar.pack(fill='x',pady=(0,4))
+        self.repeat=tk.BooleanVar(value=False)
+        self.repeat_ms=tk.StringVar(value='120')
+        self.repeat_button=ttk.Checkbutton(repeat_bar,text='按钮长按连发',variable=self.repeat,
+                                          command=self._restart_repeat)
+        self.repeat_button.pack(side='left')
+        ttk.Label(repeat_bar,text='连发周期 ms').pack(side='left',padx=(12,4))
+        self.repeat_input=ttk.Spinbox(repeat_bar,from_=50,to=1000,increment=10,width=6,
+                                      textvariable=self.repeat_ms)
+        self.repeat_input.pack(side='left')
         self.hint=tk.StringVar()
         self.hint_label=ttk.Label(self,textvariable=self.hint,wraplength=880,foreground='#526174')
         self.hint_label.pack(fill='x',pady=(0,8))
@@ -235,20 +276,34 @@ class ProControllerView(ttk.Frame):
         self.canvas.pack(fill='both',expand=True)
         self.canvas.bind('<Configure>',self._resize)
         self.canvas.bind('<Button-1>',self._click)
+        self.canvas.bind('<ButtonRelease-1>',self._mouse_release)
         self.canvas.bind('<Motion>',self._motion)
         self.canvas.bind('<Leave>',lambda event:self._set_hover(None))
         self.canvas.bind('<KeyPress>',self._key_press)
         self.canvas.bind('<KeyRelease>',self._key_release)
-        self.canvas.bind('<FocusOut>',lambda event:self._down.clear())
+        self.canvas.bind('<FocusOut>',lambda event:self.reset_keys())
+        self.canvas.bind('<FocusIn>',lambda event:self._blocked_keys.clear())
         self.set_mode('click',focus=False)
         if load_error:self.info.set(load_error)
 
     @property
     def dirty(self):return self.draft is not None and self.draft!=self.bindings
 
-    def reset_keys(self):self._down.clear()
+    def reset_keys(self,block_held=False):
+        had_input=bool(self.held_actions)
+        if block_held:self._blocked_keys.update(self._down)
+        self._down.clear();self._key_actions.clear();self._mouse_action=None
+        self.held_actions.clear()
+        if self._repeat_timer is not None:
+            self.after_cancel(self._repeat_timer);self._repeat_timer=None
+        try:
+            if self.canvas.grab_current()==self.canvas:self.canvas.grab_release()
+        except tk.TclError:pass
+        if had_input and self.streaming and self.on_state:self.on_state(report_for_actions(()))
+        for control in self.controls.values():control.paint()
 
     def destroy(self):
+        self.reset_keys()
         for timer in (self._flash_timer,self._resize_timer):
             if timer is not None:
                 try:self.after_cancel(timer)
@@ -258,8 +313,10 @@ class ProControllerView(ttk.Frame):
     def set_mode(self,mode,focus=True):
         if mode not in ('click','edit'):raise ValueError('无效的交互模式。')
         if mode=='edit' and self.draft is None:self.draft=dict(self.bindings)
-        self.mode=mode;self.mode_var.set(mode);self.selected=None;self._down.clear()
-        self.hint.set('点击模式：单击手柄，或聚焦手柄区域后按绑定键，每次触发一次输入，长按不连发。' if mode=='click' else
+        self.reset_keys()
+        self.mode=mode;self.mode_var.set(mode);self.selected=None
+        self.hint.set(('实时模式：按下保持，松开释放；支持组合键，发送期间可继续操作。可选按钮长按连发。' if self.streaming else
+                       '兼容模式：每次触发一次定时输入，长按不连发；实时输入需要升级固件。') if mode=='click' else
                       '编辑模式：点击一个部位，再按下新的键盘按键；编辑不会发送输入，修改后点击“保存映射”。Esc 取消选键。')
         self.info.set('点击手柄开始操作。' if mode=='click' else '点击要修改的部位；也可以离线编辑和保存映射。')
         self._update_controls()
@@ -268,12 +325,23 @@ class ProControllerView(ttk.Frame):
 
     def set_available(self,available):
         available=bool(available)
-        if available!=self.available:self.available=available;self._update_controls()
+        if available!=self.available:
+            if not available:self.reset_keys()
+            self.available=available;self._update_controls()
+
+    def set_streaming(self,enabled):
+        enabled=bool(enabled and self.on_state)
+        if enabled!=self.streaming:
+            self.reset_keys();self.streaming=enabled
+            self.set_mode(self.mode,focus=False)
 
     def _update_controls(self):
         for control in self.controls.values():
             control.configure(state='normal' if self.mode=='edit' or self.available else 'disabled')
         editing=self.mode=='edit'
+        self.repeat_button.configure(state='normal' if self.streaming and not editing else 'disabled')
+        self.repeat_input.configure(state='normal' if self.streaming and not editing else 'disabled')
+        self.hold_input.configure(state='disabled' if self.streaming else 'normal')
         self.save_button.configure(state='normal' if editing and self.dirty else 'disabled')
         self.cancel_button.configure(state='normal' if editing else 'disabled')
         self.clear_button.configure(state='normal' if editing and self.selected and self.draft[self.selected] else 'disabled')
@@ -336,8 +404,48 @@ class ProControllerView(ttk.Frame):
     def _click(self,event):
         self.canvas.focus_set()
         target=self._hit(event.x,event.y)
+        if self.streaming and self.mode=='click':
+            if target and target.state!='disabled':
+                if target.name=='DPAD_CENTER':self.reset_keys();return 'break'
+                self._mouse_action=target.name
+                self.canvas.grab_set()
+                self._emit_state()
+            return 'break'
         if target:target.invoke()
         return 'break'
+
+    def _mouse_release(self,event):
+        if self._mouse_action is not None:
+            self._mouse_action=None
+            try:self.canvas.grab_release()
+            except tk.TclError:pass
+            self._emit_state()
+
+    def _emit_state(self):
+        self.held_actions=set(self._key_actions.values())
+        if self._mouse_action:self.held_actions.add(self._mouse_action)
+        effective=self.held_actions
+        if self.repeat.get() and not self._repeat_phase:
+            effective={name for name in effective if 'buttons' not in ACTION_ARGUMENTS[name]}
+        if self.streaming and self.on_state:self.on_state(report_for_actions(effective))
+        for control in self.controls.values():control.paint()
+        repeating=self.repeat.get() and any('buttons' in ACTION_ARGUMENTS[name] for name in self.held_actions)
+        if repeating and self._repeat_timer is None:
+            try:interval=max(50,min(1000,int(self.repeat_ms.get())))
+            except ValueError:interval=120
+            self._repeat_timer=self.after(interval//2,self._repeat_tick)
+        elif not repeating:
+            if self._repeat_timer is not None:self.after_cancel(self._repeat_timer);self._repeat_timer=None
+            self._repeat_phase=True
+
+    def _repeat_tick(self):
+        self._repeat_timer=None;self._repeat_phase=not self._repeat_phase
+        self._emit_state()
+
+    def _restart_repeat(self):
+        if self._repeat_timer is not None:self.after_cancel(self._repeat_timer);self._repeat_timer=None
+        self._repeat_phase=True
+        self._emit_state()
 
     def _set_hover(self,name):
         previous=self.hover
@@ -368,18 +476,29 @@ class ProControllerView(ttk.Frame):
                 self.info.set('请选择字母、数字、方向键、功能键或常用单键；Esc 保留用于停止。')
                 return 'break'
             return None
+        if key in self._blocked_keys:return 'break'
         if key in self._down:return 'break'
         self._down.add(key)
         if self.mode=='edit':
             if self.selected:self.bind_selected(key)
             return 'break'
         for name,bound in self.bindings.items():
-            if bound==key:self.controls[name].invoke();return 'break'
+            if bound==key:
+                if self.streaming:
+                    if self.available:
+                        if name=='DPAD_CENTER':self.reset_keys()
+                        else:self._key_actions[key]=name;self._emit_state()
+                else:self.controls[name].invoke()
+                return 'break'
         return None
 
     def _key_release(self,event):
         key=key_from_event(event)
+        if key:self._blocked_keys.discard(key)
         if key:self._down.discard(key)
+        if key in self._key_actions:
+            del self._key_actions[key]
+            self._emit_state()
 
     def _resize(self,event):
         self.hint_label.configure(wraplength=max(350,event.width-16))
